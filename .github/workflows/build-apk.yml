@@ -1,4 +1,13 @@
-name: Build Saul APK
+name: Build Saul APK (zip upload)
+
+# ZIP-IN-REPO FLOW for phone-only upload:
+#   1. Upload saul-king-app.zip to the repository ROOT as-is (do NOT extract).
+#   2. Actions tab -> Build Saul APK (zip upload) -> Run workflow.
+#   3. Download the `saul-apk` artifact, install on the phone.
+#
+# Picks the zip containing a Gradle project (root settings.gradle +
+# app/build.gradle). If you uploaded extracted files instead, this workflow
+# stands down and the normal "Build Saul APK" workflow builds ./app.
 
 on:
   push:
@@ -11,39 +20,85 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
+      - name: Unpack project
+        id: unpack
+        run: |
+          shopt -s nullglob
+          zips=( *.zip )
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "No .zip in repo root — extracted layout; other workflow handles it."
+            echo "has_zip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ls -la *.zip
+          ZIP=""
+          while IFS= read -r z; do
+            if unzip -l "$z" | grep -qE '(^| )settings\.gradle(\.kts)?$' \
+            && unzip -l "$z" | grep -qE '(^| )app/build\.gradle(\.kts)?$'; then
+              echo "candidate: $z"
+              ZIP="$z"
+            else
+              echo "skipping: $z (no Gradle project inside)"
+            fi
+          done < <(printf '%s\n' "${zips[@]}" | sort -V)
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: no zip with a Gradle project. Upload saul-king-app.zip to repo ROOT."
+            echo "has_zip=false" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "Unpacking $ZIP"
+          rm -rf project
+          unzip -o "$ZIP" -d project
+          # handle zips with a top-level folder (project/saul-app/settings.gradle)
+          if [ ! -f project/settings.gradle ] && [ ! -f project/settings.gradle.kts ]; then
+            SUB=$(find project -maxdepth 2 -name settings.gradle -o -maxdepth 2 -name settings.gradle.kts | head -n1 | xargs -r dirname)
+            if [ -n "$SUB" ] && [ "$SUB" != "project" ]; then
+              echo "Top-level folder detected: $SUB — moving up"
+              shopt -s dotglob
+              mv "$SUB"/* project/ 2>/dev/null || true
+            else
+              echo "ERROR: unpacked $ZIP but no settings.gradle. Top level:"
+              ls -la project
+              exit 1
+            fi
+          fi
+          ls -la project
+          echo "has_zip=true" >> "$GITHUB_OUTPUT"
+
       - name: Set up Java 17
+        if: steps.unpack.outputs.has_zip == 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
 
-      - name: Set up Android SDK (preinstalled, no download action)
+      - name: Set up Android SDK (preinstalled)
+        if: steps.unpack.outputs.has_zip == 'true'
         run: |
           set -x
           export ANDROID_HOME=${ANDROID_HOME:-/usr/local/lib/android/sdk}
           export ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}
           echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
-          ls "$ANDROID_HOME/cmdline-tools" || true
-          SDMANAGER=""
           if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
             SDMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           else
-            # fall back to newest versioned dir
             SDMANAGER=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n1)
           fi
-          echo "sdkmanager=$SDMANAGER"
           yes | "$SDMANAGER" --licenses || true
           "$SDMANAGER" "platforms;android-34" "build-tools;34.0.0" "platform-tools" || true
 
       - name: Set up Gradle
+        if: steps.unpack.outputs.has_zip == 'true'
         uses: gradle/actions/setup-gradle@v3
 
       - name: Build release APK
-        run: gradle :app:assembleRelease --stacktrace
+        if: steps.unpack.outputs.has_zip == 'true'
+        run: gradle -p project :app:assembleRelease --stacktrace
 
       - name: Upload APK
+        if: steps.unpack.outputs.has_zip == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: saul-apk
-          path: app/build/outputs/apk/release/app-release.apk
+          path: project/app/build/outputs/apk/release/app-release.apk
